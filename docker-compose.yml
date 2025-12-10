@@ -1,0 +1,104 @@
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: wallet_db
+    environment:
+      POSTGRES_USER: ${DB_USER:-wallet_user}
+      POSTGRES_PASSWORD: ${DB_PASS:-wallet_password}
+      POSTGRES_DB: ${DB_NAME:-wallet_db}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-wallet_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - wallet_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: wallet_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - wallet_network
+
+  api:
+    build: .
+    container_name: wallet_api
+    environment:
+      DEBUG: ${DEBUG:-False}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      APP_PORT: ${APP_PORT:-8000}
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-wallet_user}:${DB_PASS:-wallet_password}@db:5432/${DB_NAME:-wallet_db}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY}
+      PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY}
+      PAYSTACK_WEBHOOK_SECRET: ${PAYSTACK_WEBHOOK_SECRET}
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - wallet_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    container_name: wallet_nginx
+    ports:
+      - "80:80"
+    environment:
+      SERVER_NAME: ${SERVER_NAME:-_}
+      API_HOST: ${API_HOST:-api}
+      API_PORT: ${APP_PORT:-8000}
+      PROXY_CONNECT_TIMEOUT: 60s
+      PROXY_SEND_TIMEOUT: 60s
+      PROXY_READ_TIMEOUT: 60s
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    command: >
+      sh -c "envsubst '$${SERVER_NAME} $${API_HOST} $${API_PORT} $${PROXY_CONNECT_TIMEOUT} $${PROXY_SEND_TIMEOUT} $${PROXY_READ_TIMEOUT}' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"
+    depends_on:
+      - api
+    networks:
+      - wallet_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  wallet_network:
+    driver: bridge
