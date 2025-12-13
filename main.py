@@ -1,5 +1,5 @@
 """
-Authentication Service API - Main Application Entry Point
+Wallet Service API - Main Application Entry Point
 """
 
 import logging
@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.core.logger import setup_logging
-from app.api.v1.routes import auth, keys
+from app.api.v1.routes import auth, keys, wallet
 from app.api.db.database import init_db
 from app.api.utils.exceptions import WalletServiceException
 from app.api.utils.handlers import wallet_service_exception_handler
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="Authentication Service API with Google OAuth, JWT & API Keys",
+    description="Wallet Service API with Paystack Integration, JWT & API Keys",
     debug=settings.DEBUG,
     lifespan=lifespan,
 )
@@ -96,6 +96,7 @@ async def root():
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(keys.router, prefix="/api/v1")
+app.include_router(wallet.router, prefix="/api/v1")
 
 if __name__ == "__main__":
     import uvicorn

@@ -41,6 +41,16 @@ class AuthService:
             try:
                 user = await AuthService.get_user_by_email(email, session)
                 logger.info(f"Existing user found: {email}")
+
+                # Ensure user has a wallet
+                from app.api.v1.services.wallet import WalletService
+                try:
+                    await WalletService.get_wallet_by_user_id(user.id, session)
+                except:
+                    # Create wallet if it doesn't exist
+                    await WalletService.create_wallet(user.id, session)
+                    logger.info(f"Wallet created for existing user: {email}")
+
                 return user
             except UserNotFoundException:
                 logger.info(f"User not found, creating new user: {email}")
@@ -56,6 +66,12 @@ class AuthService:
                 await session.commit()
                 await session.refresh(user)
                 logger.info(f"New user created successfully: {email}")
+
+                # Create wallet for new user
+                from app.api.v1.services.wallet import WalletService
+                await WalletService.create_wallet(user.id, session)
+                logger.info(f"Wallet created for new user: {email}")
+
                 return user
 
         except UserNotFoundException:
