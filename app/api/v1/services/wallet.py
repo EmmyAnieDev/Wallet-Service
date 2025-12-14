@@ -10,6 +10,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func
 from sqlmodel import select, desc
 
 from app.api.v1.models.wallet import Wallet, Transaction
@@ -341,25 +342,40 @@ class WalletService:
 
     @staticmethod
     async def get_user_transactions(
-        user_id: UUID, session: AsyncSession
-    ) -> list[Transaction]:
+        user_id: UUID,
+        session: AsyncSession,
+        offset: int = 0,
+        limit: int = 20
+    ) -> tuple[list[Transaction], int]:
         """
-        Get user transaction history.
+        Get user transaction history with pagination.
 
         Args:
             user_id (UUID): User UUID
             session (AsyncSession): Database session
+            offset (int): Number of records to skip
+            limit (int): Maximum number of records to return
 
         Returns:
-            list[Transaction]: List of transactions
+            tuple[list[Transaction], int]: Tuple of (transactions list, total count)
         """
+        count_statement = (
+            select(func.count())
+            .select_from(Transaction)
+            .where(Transaction.user_id == user_id)
+        )
+        count_result = await session.execute(count_statement)
+        total = count_result.scalar() or 0
+
         statement = (
             select(Transaction)
             .where(Transaction.user_id == user_id)
             .order_by(desc(Transaction.created_at))
+            .offset(offset)
+            .limit(limit)
         )
         result = await session.execute(statement)
         transactions = result.scalars().all()
 
-        logger.info(f"Retrieved {len(transactions)} transactions for user {user_id}")
-        return list(transactions)
+        logger.info(f"Retrieved {len(transactions)} of {total} transactions for user {user_id}")
+        return list(transactions), total

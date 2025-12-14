@@ -5,7 +5,7 @@ This module provides endpoints for wallet operations including deposits, transfe
 """
 
 import logging
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,7 @@ from app.api.v1.schemas.response import SuccessResponseModel
 from app.api.v1.services.wallet import WalletService
 from app.api.v1.services.paystack import PaystackService
 from app.api.utils.response import success_response, error_response
+from app.api.utils.pagination import PaginationParams, PaginatedResponse
 from app.api.utils.exceptions import (
     WalletNotFoundException,
     InsufficientBalanceException,
@@ -402,30 +403,41 @@ async def transfer(
 @router.get(
     "/transactions",
     status_code=status.HTTP_200_OK,
-    response_model=SuccessResponseModel[dict]
+    response_model=SuccessResponseModel[PaginatedResponse[TransactionResponse]]
 )
 async def get_transactions(
+    page: int = Query(default=1, ge=1, description="Page number"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
     auth: AuthContext = Depends(require_permission("read")),
     session: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """
-    Get transaction history for the authenticated user.
+    Get paginated transaction history for the authenticated user.
 
     Requires either:
     - JWT authentication
     - API key with 'read' permission
 
     Args:
+        page (int): Page number (default: 1)
+        page_size (int): Items per page (default: 20, max: 100)
         auth (AuthContext): Authentication context
         session (AsyncSession): Database session
 
     Returns:
-        JSONResponse: List of transactions
+        JSONResponse: Paginated list of transactions
     """
     try:
-        transactions = await WalletService.get_user_transactions(auth.user_id, session)
+        pagination = PaginationParams(page=page, page_size=page_size)
 
-        logger.info(f"Retrieved {len(transactions)} transactions for user {auth.email}")
+        transactions, total = await WalletService.get_user_transactions(
+            auth.user_id,
+            session,
+            offset=pagination.offset,
+            limit=pagination.limit
+        )
+
+        logger.info(f"Retrieved {len(transactions)} of {total} transactions for user {auth.email}")
 
         transaction_list = [
             TransactionResponse(
@@ -436,14 +448,21 @@ async def get_transactions(
                 reference=txn.reference,
                 created_at=txn.created_at,
                 description=txn.description or ""
-            ).model_dump()
+            )
             for txn in transactions
         ]
+
+        paginated_data = PaginatedResponse.create(
+            items=transaction_list,
+            total=total,
+            page=page,
+            page_size=page_size
+        )
 
         return success_response(
             status_code=status.HTTP_200_OK,
             message="Transactions retrieved successfully",
-            data={"transactions": transaction_list}
+            data=paginated_data.model_dump()
         )
     except Exception as e:
         logger.error(f"Transaction retrieval failed: {str(e)}", exc_info=True)
