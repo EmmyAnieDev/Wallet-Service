@@ -119,7 +119,6 @@ class APIKeyService:
         old_key.revoked = True
         old_key.updated_at = datetime.utcnow()
 
-        # Check if user has room for a new key (after revoking the old one)
         statement = select(APIKey).where(
             APIKey.user_id == user_id,
             APIKey.revoked == False,

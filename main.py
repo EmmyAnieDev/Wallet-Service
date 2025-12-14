@@ -7,12 +7,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 
 from app.api.core.logger import setup_logging
 from app.api.v1.routes import auth, keys, wallet
 from app.api.db.database import init_db
 from app.api.utils.exceptions import WalletServiceException
-from app.api.utils.handlers import wallet_service_exception_handler
+from app.api.utils.handlers import wallet_service_exception_handler, validation_exception_handler
 from config import settings
 
 setup_logging()
@@ -61,6 +62,7 @@ app.add_middleware(
 )
 
 app.add_exception_handler(WalletServiceException, wallet_service_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
 
 @app.get("/health", tags=["Health"])
@@ -100,12 +102,13 @@ app.include_router(wallet.router, prefix="/api/v1")
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     logger.info(f"Starting server on 0.0.0.0:{settings.APP_PORT}")
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=settings.APP_PORT,
         reload=settings.DEBUG,
+        reload_excludes=["logs/*", "*.log", "__pycache__/*", ".git/*"],
         log_config=None,
     )

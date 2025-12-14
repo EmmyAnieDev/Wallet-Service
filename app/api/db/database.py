@@ -33,10 +33,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
     Yields:
         AsyncSession: Database session
-
-    Examples:
-        >>> async def route(db: AsyncSession = Depends(get_db)):
-        ...     user = await db.get(User, user_id)
     """
     async with AsyncSessionLocal() as session:
         try:

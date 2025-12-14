@@ -6,6 +6,7 @@ This module provides endpoints for wallet operations including deposits, transfe
 
 import logging
 from fastapi import APIRouter, Depends, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.core.auth import require_permission, AuthContext
@@ -19,20 +20,32 @@ from app.api.v1.schemas.wallet import (
     TransactionResponse,
     VerifyTransactionResponse,
 )
+from app.api.v1.schemas.response import SuccessResponseModel
 from app.api.v1.services.wallet import WalletService
 from app.api.v1.services.paystack import PaystackService
-from app.api.utils.response import ResponsePayload
+from app.api.utils.response import success_response, error_response
+from app.api.utils.exceptions import (
+    WalletNotFoundException,
+    InsufficientBalanceException,
+    TransactionNotFoundException,
+    PaymentProcessingException,
+    NetworkException,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
 
 
-@router.post("/deposit", status_code=status.HTTP_200_OK)
+@router.post(
+    "/deposit",
+    status_code=status.HTTP_200_OK,
+    response_model=SuccessResponseModel[DepositResponse]
+)
 async def deposit(
     request: DepositRequest,
     auth: AuthContext = Depends(require_permission("deposit")),
     session: AsyncSession = Depends(get_db),
-) -> dict:
+) -> JSONResponse:
     """
     Initialize a deposit transaction via Paystack.
 
@@ -46,37 +59,63 @@ async def deposit(
         session (AsyncSession): Database session
 
     Returns:
-        dict: Payment link and transaction reference
-
-    Raises:
-        WalletNotFoundException: If user wallet not found
+        JSONResponse: Payment link and transaction reference
     """
-    result = await WalletService.initialize_deposit(
-        user_id=auth.user_id,
-        amount=request.amount,
-        email=auth.email,
-        session=session,
-    )
+    try:
+        result = await WalletService.initialize_deposit(
+            user_id=auth.user_id,
+            amount=request.amount,
+            email=auth.email,
+            session=session,
+        )
 
-    logger.info(f"Deposit initialized for user {auth.email}: {result['reference']}")
+        logger.info(f"Deposit initialized for user {auth.email}: {result['reference']}")
 
-    return ResponsePayload.success(
-        message="Deposit initialized successfully",
-        data=DepositResponse(
-            reference=result["reference"],
-            authorization_url=result["authorization_url"],
-            amount=result["amount"],
-            status="pending"
-        ).model_dump(),
-        code=status.HTTP_200_OK
-    )
+        return success_response(
+            status_code=status.HTTP_200_OK,
+            message="Deposit initialized successfully",
+            data=DepositResponse(
+                reference=result["reference"],
+                authorization_url=result["authorization_url"],
+                amount=result["amount"],
+                status="pending"
+            ).model_dump()
+        )
+    except WalletNotFoundException:
+        logger.error(f"Wallet not found for user {auth.user_id}")
+        return error_response(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="Wallet not found",
+            detail="WALLET_NOT_FOUND"
+        )
+    except PaymentProcessingException:
+        logger.error(f"Payment processing failed for user {auth.email}")
+        return error_response(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="Failed to initialize payment",
+            detail="PAYMENT_PROCESSING_ERROR"
+        )
+    except NetworkException:
+        logger.error("Network error connecting to payment gateway")
+        return error_response(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            message="Payment service temporarily unavailable",
+            detail="NETWORK_ERROR"
+        )
+    except Exception as e:
+        logger.error(f"Deposit initialization failed: {str(e)}", exc_info=True)
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="An unexpected error occurred",
+            detail="INTERNAL_SERVER_ERROR"
+        )
 
 
 @router.post("/paystack/webhook", status_code=status.HTTP_200_OK)
 async def paystack_webhook(
     request: Request,
     session: AsyncSession = Depends(get_db),
-) -> dict:
+) -> JSONResponse:
     """
     Handle Paystack webhook notifications.
 
@@ -90,59 +129,78 @@ async def paystack_webhook(
         session (AsyncSession): Database session
 
     Returns:
-        dict: Success acknowledgment
+        JSONResponse: Success acknowledgment
     """
-    body = await request.body()
-    signature = request.headers.get("x-paystack-signature", "")
+    try:
+        body = await request.body()
+        signature = request.headers.get("x-paystack-signature", "")
 
-    if not PaystackService.verify_webhook_signature(signature, body):
-        logger.warning("Invalid Paystack webhook signature")
-        return ResponsePayload.error(
-            message="Invalid signature",
-            error_code="INVALID_SIGNATURE",
-            code=status.HTTP_401_UNAUTHORIZED
+        if not PaystackService.verify_webhook_signature(signature, body):
+            logger.warning("Invalid Paystack webhook signature")
+            return error_response(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                message="Invalid signature",
+                detail="INVALID_SIGNATURE"
+            )
+
+        import json
+        data = json.loads(body)
+
+        event = data.get("event")
+        payload = data.get("data", {})
+
+        logger.info(f"Paystack webhook received: {event}")
+
+        if event != "charge.success":
+            logger.info(f"Ignoring webhook event: {event}")
+            return success_response(
+                status_code=status.HTTP_200_OK,
+                message="Event ignored",
+                data={"status": True}
+            )
+
+        reference = payload.get("reference")
+        paystack_status = payload.get("status")
+
+        await WalletService.process_webhook(
+            reference=reference,
+            status=paystack_status,
+            session=session,
         )
 
-    import json
-    data = json.loads(body)
+        logger.info(f"Webhook processed successfully: {reference}")
 
-    event = data.get("event")
-    payload = data.get("data", {})
-
-    logger.info(f"Paystack webhook received: {event}")
-
-    if event != "charge.success":
-        logger.info(f"Ignoring webhook event: {event}")
-        return ResponsePayload.success(
-            message="Event ignored",
-            data={"status": True},
-            code=status.HTTP_200_OK
+        return success_response(
+            status_code=status.HTTP_200_OK,
+            message="Webhook processed",
+            data={"status": True}
+        )
+    except TransactionNotFoundException:
+        logger.error("Transaction not found in webhook processing")
+        return error_response(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="Transaction not found",
+            detail="TRANSACTION_NOT_FOUND"
+        )
+    except Exception as e:
+        logger.error(f"Webhook processing failed: {str(e)}", exc_info=True)
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="Webhook processing failed",
+            detail="WEBHOOK_ERROR"
         )
 
-    reference = payload.get("reference")
-    paystack_status = payload.get("status")
 
-    await WalletService.process_webhook(
-        reference=reference,
-        status=paystack_status,
-        session=session,
-    )
-
-    logger.info(f"Webhook processed successfully: {reference}")
-
-    return ResponsePayload.success(
-        message="Webhook processed",
-        data={"status": True},
-        code=status.HTTP_200_OK
-    )
-
-
-@router.get("/verify/{reference}", status_code=status.HTTP_200_OK)
+@router.get(
+    "/verify/{reference}",
+    status_code=status.HTTP_200_OK,
+    response_model=SuccessResponseModel[VerifyTransactionResponse]
+)
 async def verify_transaction(
     reference: str,
     auth: AuthContext = Depends(require_permission("read")),
     session: AsyncSession = Depends(get_db),
-) -> dict:
+) -> JSONResponse:
     """
     Verify transaction status.
 
@@ -155,53 +213,75 @@ async def verify_transaction(
         session (AsyncSession): Database session
 
     Returns:
-        dict: Transaction verification data
-
-    Raises:
-        TransactionNotFoundException: If transaction not found
-        PaymentProcessingException: If Paystack verification fails
+        JSONResponse: Transaction verification data
     """
-    transaction = await WalletService.get_transaction_by_reference(reference, session)
+    try:
+        transaction = await WalletService.get_transaction_by_reference(reference, session)
 
-    if transaction.status == "pending":
-        paystack_data = await PaystackService.verify_transaction(reference)
+        if transaction.status == "pending":
+            paystack_data = await PaystackService.verify_transaction(reference)
 
-        amount_in_ngn = paystack_data.get("amount", 0) / 100
+            amount_in_ngn = paystack_data.get("amount", 0) / 100
 
-        logger.info(f"Transaction verified via Paystack: {reference} - {paystack_data.get('status')}")
+            logger.info(f"Transaction verified via Paystack: {reference} - {paystack_data.get('status')}")
 
-        return ResponsePayload.success(
-            message="Transaction verified with Paystack",
+            return success_response(
+                status_code=status.HTTP_200_OK,
+                message="Transaction verified with Paystack",
+                data=VerifyTransactionResponse(
+                    reference=paystack_data.get("reference", ""),
+                    status=paystack_data.get("status", "unknown"),
+                    amount=amount_in_ngn,
+                    gateway_response=paystack_data.get("gateway_response", ""),
+                    paid_at=paystack_data.get("paid_at")
+                ).model_dump()
+            )
+
+        logger.info(f"Transaction status from database: {reference} - {transaction.status}")
+
+        return success_response(
+            status_code=status.HTTP_200_OK,
+            message="Transaction status retrieved",
             data=VerifyTransactionResponse(
-                reference=paystack_data.get("reference", ""),
-                status=paystack_data.get("status", "unknown"),
-                amount=amount_in_ngn,
-                gateway_response=paystack_data.get("gateway_response", ""),
-                paid_at=paystack_data.get("paid_at", "")
-            ).model_dump(),
-            code=status.HTTP_200_OK
+                reference=transaction.reference,
+                status=transaction.status,
+                amount=transaction.amount,
+                gateway_response="Transaction already processed",
+                paid_at=str(transaction.updated_at) if transaction.status == "success" else None
+            ).model_dump()
+        )
+    except TransactionNotFoundException:
+        logger.error(f"Transaction not found: {reference}")
+        return error_response(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="Transaction not found",
+            detail="TRANSACTION_NOT_FOUND"
+        )
+    except PaymentProcessingException:
+        logger.error(f"Payment verification failed for transaction: {reference}")
+        return error_response(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="Failed to verify transaction",
+            detail="VERIFICATION_FAILED"
+        )
+    except Exception as e:
+        logger.error(f"Transaction verification failed: {str(e)}", exc_info=True)
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="An unexpected error occurred",
+            detail="INTERNAL_SERVER_ERROR"
         )
 
-    logger.info(f"Transaction status from database: {reference} - {transaction.status}")
 
-    return ResponsePayload.success(
-        message="Transaction status retrieved",
-        data=VerifyTransactionResponse(
-            reference=transaction.reference,
-            status=transaction.status,
-            amount=transaction.amount,
-            gateway_response="Transaction already processed",
-            paid_at=str(transaction.updated_at) if transaction.status == "success" else ""
-        ).model_dump(),
-        code=status.HTTP_200_OK
-    )
-
-
-@router.get("/balance", status_code=status.HTTP_200_OK)
+@router.get(
+    "/balance",
+    status_code=status.HTTP_200_OK,
+    response_model=SuccessResponseModel[BalanceResponse]
+)
 async def get_balance(
     auth: AuthContext = Depends(require_permission("read")),
     session: AsyncSession = Depends(get_db),
-) -> dict:
+) -> JSONResponse:
     """
     Get current wallet balance.
 
@@ -214,33 +294,49 @@ async def get_balance(
         session (AsyncSession): Database session
 
     Returns:
-        dict: Current wallet balance
-
-    Raises:
-        WalletNotFoundException: If wallet not found
+        JSONResponse: Current wallet balance
     """
-    wallet = await WalletService.get_wallet_by_user_id(auth.user_id, session)
+    try:
+        wallet = await WalletService.get_wallet_by_user_id(auth.user_id, session)
 
-    logger.info(f"Balance retrieved for user {auth.email}: {wallet.balance}")
+        logger.info(f"Balance retrieved for user {auth.email}: {wallet.balance}")
 
-    return ResponsePayload.success(
-        message="Balance retrieved successfully",
-        data=BalanceResponse(
-            balance=wallet.balance,
-            wallet_number=wallet.wallet_number,
-            user_id=str(wallet.user_id),
-            currency="NGN"
-        ).model_dump(),
-        code=status.HTTP_200_OK
-    )
+        return success_response(
+            status_code=status.HTTP_200_OK,
+            message="Balance retrieved successfully",
+            data=BalanceResponse(
+                balance=wallet.balance,
+                wallet_number=wallet.wallet_number,
+                user_id=str(wallet.user_id),
+                currency="NGN"
+            ).model_dump()
+        )
+    except WalletNotFoundException:
+        logger.error(f"Wallet not found for user {auth.user_id}")
+        return error_response(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="Wallet not found",
+            detail="WALLET_NOT_FOUND"
+        )
+    except Exception as e:
+        logger.error(f"Balance retrieval failed: {str(e)}", exc_info=True)
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="An unexpected error occurred",
+            detail="INTERNAL_SERVER_ERROR"
+        )
 
 
-@router.post("/transfer", status_code=status.HTTP_200_OK)
+@router.post(
+    "/transfer",
+    status_code=status.HTTP_200_OK,
+    response_model=SuccessResponseModel[TransferResponse]
+)
 async def transfer(
     request: TransferRequest,
     auth: AuthContext = Depends(require_permission("transfer")),
     session: AsyncSession = Depends(get_db),
-) -> dict:
+) -> JSONResponse:
     """
     Transfer funds to another wallet.
 
@@ -254,42 +350,64 @@ async def transfer(
         session (AsyncSession): Database session
 
     Returns:
-        dict: Transfer confirmation
-
-    Raises:
-        WalletNotFoundException: If wallet not found
-        InsufficientBalanceException: If insufficient balance
+        JSONResponse: Transfer confirmation
     """
-    transaction = await WalletService.transfer(
-        sender_user_id=auth.user_id,
-        recipient_wallet_number=request.wallet_number,
-        amount=request.amount,
-        session=session,
-    )
+    try:
+        transaction = await WalletService.transfer(
+            sender_user_id=auth.user_id,
+            recipient_wallet_number=request.wallet_number,
+            amount=request.amount,
+            session=session,
+        )
 
-    logger.info(
-        f"Transfer completed: {auth.email} -> {request.wallet_number} "
-        f"Amount: {request.amount}, Reference: {transaction.reference}"
-    )
+        logger.info(
+            f"Transfer completed: {auth.email} -> {request.wallet_number} "
+            f"Amount: {request.amount}, Reference: {transaction.reference}"
+        )
 
-    return ResponsePayload.success(
-        message="Transfer completed successfully",
-        data=TransferResponse(
-            status="success",
-            message="Transfer completed",
-            transaction_reference=transaction.reference,
-            amount=transaction.amount,
-            timestamp=transaction.created_at
-        ).model_dump(),
-        code=status.HTTP_200_OK
-    )
+        return success_response(
+            status_code=status.HTTP_200_OK,
+            message="Transfer completed successfully",
+            data=TransferResponse(
+                status="success",
+                message="Transfer completed",
+                transaction_reference=transaction.reference,
+                amount=transaction.amount,
+                timestamp=transaction.created_at
+            ).model_dump()
+        )
+    except WalletNotFoundException:
+        logger.error("Wallet not found in transfer")
+        return error_response(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="Wallet not found",
+            detail="WALLET_NOT_FOUND"
+        )
+    except InsufficientBalanceException:
+        logger.error(f"Insufficient balance for transfer by user {auth.email}")
+        return error_response(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="Insufficient balance",
+            detail="INSUFFICIENT_BALANCE"
+        )
+    except Exception as e:
+        logger.error(f"Transfer failed: {str(e)}", exc_info=True)
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="An unexpected error occurred",
+            detail="INTERNAL_SERVER_ERROR"
+        )
 
 
-@router.get("/transactions", status_code=status.HTTP_200_OK)
+@router.get(
+    "/transactions",
+    status_code=status.HTTP_200_OK,
+    response_model=SuccessResponseModel[dict]
+)
 async def get_transactions(
     auth: AuthContext = Depends(require_permission("read")),
     session: AsyncSession = Depends(get_db),
-) -> dict:
+) -> JSONResponse:
     """
     Get transaction history for the authenticated user.
 
@@ -302,27 +420,35 @@ async def get_transactions(
         session (AsyncSession): Database session
 
     Returns:
-        dict: List of transactions
+        JSONResponse: List of transactions
     """
-    transactions = await WalletService.get_user_transactions(auth.user_id, session)
+    try:
+        transactions = await WalletService.get_user_transactions(auth.user_id, session)
 
-    logger.info(f"Retrieved {len(transactions)} transactions for user {auth.email}")
+        logger.info(f"Retrieved {len(transactions)} transactions for user {auth.email}")
 
-    transaction_list = [
-        TransactionResponse(
-            transaction_id=str(txn.id),
-            type=txn.type,
-            amount=txn.amount,
-            status=txn.status,
-            reference=txn.reference,
-            created_at=txn.created_at,
-            description=txn.description or ""
-        ).model_dump()
-        for txn in transactions
-    ]
+        transaction_list = [
+            TransactionResponse(
+                transaction_id=str(txn.id),
+                type=txn.type,
+                amount=txn.amount,
+                status=txn.status,
+                reference=txn.reference,
+                created_at=txn.created_at,
+                description=txn.description or ""
+            ).model_dump()
+            for txn in transactions
+        ]
 
-    return ResponsePayload.success(
-        message="Transactions retrieved successfully",
-        data=transaction_list,
-        code=status.HTTP_200_OK
-    )
+        return success_response(
+            status_code=status.HTTP_200_OK,
+            message="Transactions retrieved successfully",
+            data={"transactions": transaction_list}
+        )
+    except Exception as e:
+        logger.error(f"Transaction retrieval failed: {str(e)}", exc_info=True)
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="An unexpected error occurred",
+            detail="INTERNAL_SERVER_ERROR"
+        )

@@ -42,12 +42,10 @@ class AuthService:
                 user = await AuthService.get_user_by_email(email, session)
                 logger.info(f"Existing user found: {email}")
 
-                # Ensure user has a wallet
                 from app.api.v1.services.wallet import WalletService
                 try:
                     await WalletService.get_wallet_by_user_id(user.id, session)
-                except:
-                    # Create wallet if it doesn't exist
+                except Exception:
                     await WalletService.create_wallet(user.id, session)
                     logger.info(f"Wallet created for existing user: {email}")
 

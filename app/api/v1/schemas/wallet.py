@@ -145,7 +145,7 @@ class VerifyTransactionResponse(BaseModel):
     status: str = Field(..., description="Paystack transaction status")
     amount: Decimal = Field(..., description="Transaction amount in NGN")
     gateway_response: str = Field(..., description="Payment gateway response")
-    paid_at: str = Field(None, description="Payment completion timestamp")
+    paid_at: str | None = Field(None, description="Payment completion timestamp")
 
     class Config:
         json_schema_extra = {

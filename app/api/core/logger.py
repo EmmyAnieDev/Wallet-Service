@@ -31,9 +31,11 @@ LOG_CONFIG = {
         },
     },
     "loggers": {
-        "uvicorn": {"handlers": ["console", "file"], "level": "INFO"},
-        "uvicorn.error": {"handlers": ["console", "file"], "level": "INFO"},
-        "uvicorn.access": {"handlers": ["console", "file"], "level": "INFO"},
+        "uvicorn": {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "uvicorn.error": {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "uvicorn.access": {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "sqlalchemy.engine": {"handlers": ["file"], "level": "INFO", "propagate": False},
+        "watchfiles.main": {"handlers": [], "level": "WARNING", "propagate": False},
         "app": {
             "handlers": ["console", "file"],
             "level": "INFO",
@@ -41,12 +43,11 @@ LOG_CONFIG = {
         },
     },
     "root": {
-        "handlers": ["console", "file"],
-        "level": "INFO",
+        "handlers": ["console"],
+        "level": "WARNING",
     },
 }
 
-logging.config.dictConfig(LOG_CONFIG)
 logger = logging.getLogger("app")
 
 
