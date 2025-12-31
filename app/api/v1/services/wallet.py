@@ -65,13 +65,14 @@ class WalletService:
         return wallet
 
     @staticmethod
-    async def get_wallet_by_user_id(user_id: UUID, session: AsyncSession) -> Wallet:
+    async def get_wallet_by_user_id(user_id: UUID, session: AsyncSession, for_update: bool = False) -> Wallet:
         """
         Get wallet by user ID.
 
         Args:
             user_id (UUID): User UUID
             session (AsyncSession): Database session
+            for_update (bool): Lock row for update to prevent race conditions
 
         Returns:
             Wallet: User's wallet
@@ -80,6 +81,8 @@ class WalletService:
             WalletNotFoundException: If wallet not found
         """
         statement = select(Wallet).where(Wallet.user_id == user_id)
+        if for_update:
+            statement = statement.with_for_update()
         result = await session.execute(statement)
         wallet = result.scalar_one_or_none()
 
@@ -90,13 +93,14 @@ class WalletService:
         return wallet
 
     @staticmethod
-    async def get_wallet_by_number(wallet_number: str, session: AsyncSession) -> Wallet:
+    async def get_wallet_by_number(wallet_number: str, session: AsyncSession, for_update: bool = False) -> Wallet:
         """
         Get wallet by wallet number.
 
         Args:
             wallet_number (str): Wallet number
             session (AsyncSession): Database session
+            for_update (bool): Lock row for update to prevent race conditions
 
         Returns:
             Wallet: Wallet
@@ -105,6 +109,8 @@ class WalletService:
             WalletNotFoundException: If wallet not found
         """
         statement = select(Wallet).where(Wallet.wallet_number == wallet_number)
+        if for_update:
+            statement = statement.with_for_update()
         result = await session.execute(statement)
         wallet = result.scalar_one_or_none()
 
@@ -241,7 +247,7 @@ class WalletService:
         session: AsyncSession,
     ) -> Transaction:
         """
-        Transfer funds between wallets.
+        Transfer funds between wallets, with concurrency control.
 
         Args:
             sender_user_id (UUID): Sender user UUID
@@ -256,62 +262,55 @@ class WalletService:
             WalletNotFoundException: If wallet not found
             InsufficientBalanceException: If sender has insufficient balance
         """
-        sender_wallet = await WalletService.get_wallet_by_user_id(sender_user_id, session)
+        async with session.begin():
+            sender_wallet = await WalletService.get_wallet_by_user_id(sender_user_id, session, for_update=True)
+            recipient_wallet = await WalletService.get_wallet_by_number(recipient_wallet_number, session, for_update=True)
 
-        recipient_wallet = await WalletService.get_wallet_by_number(
-            recipient_wallet_number, session
-        )
+            if sender_wallet.id == recipient_wallet.id:
+                logger.warning(f"User {sender_user_id} attempted to transfer to their own wallet")
+                raise WalletNotFoundException("Cannot transfer to your own wallet")
 
-        if sender_wallet.balance < amount:
-            logger.warning(
-                f"Insufficient balance for transfer: "
-                f"{sender_wallet.wallet_number} (balance: {sender_wallet.balance}, required: {amount})"
+            if sender_wallet.balance < amount:
+                logger.warning(
+                    f"Insufficient balance for transfer: "
+                    f"{sender_wallet.wallet_number} (balance: {sender_wallet.balance}, required: {amount})"
+                )
+                raise InsufficientBalanceException(
+                    f"Insufficient balance. Available: {sender_wallet.balance}"
+                )
+
+            reference = f"TFR_{int(datetime.utcnow().timestamp())}_{secrets.token_hex(4)}"
+            transaction = Transaction(
+                user_id=sender_user_id,
+                wallet_id=sender_wallet.id,
+                type="transfer",
+                amount=amount,
+                status="success",
+                reference=reference,
+                sender_wallet_number=sender_wallet.wallet_number,
+                recipient_wallet_number=recipient_wallet.wallet_number,
+                description=f"Transfer to {recipient_wallet.wallet_number}"
             )
-            raise InsufficientBalanceException(
-                f"Insufficient balance. Available: {sender_wallet.balance}"
+
+            old_sender_balance = sender_wallet.balance
+            sender_wallet.balance -= amount
+            sender_wallet.updated_at = datetime.utcnow()
+
+            old_recipient_balance = recipient_wallet.balance
+            recipient_wallet.balance += amount
+            recipient_wallet.updated_at = datetime.utcnow()
+
+            session.add(transaction)
+            await session.flush()
+            await session.refresh(transaction)
+
+            logger.info(
+                f"Transfer completed: {reference} | "
+                f"Sender: {old_sender_balance} -> {sender_wallet.balance} | "
+                f"Recipient: {old_recipient_balance} -> {recipient_wallet.balance}"
             )
 
-        if sender_wallet.id == recipient_wallet.id:
-            raise WalletNotFoundException("Cannot transfer to your own wallet")
-
-        logger.info(
-            f"Transfer: {sender_wallet.wallet_number} -> {recipient_wallet.wallet_number} "
-            f"Amount: {amount}"
-        )
-
-        reference = f"TFR_{int(datetime.utcnow().timestamp())}_{secrets.token_hex(4)}"
-
-        transaction = Transaction(
-            user_id=sender_user_id,
-            wallet_id=sender_wallet.id,
-            type="transfer",
-            amount=amount,
-            status="success",
-            reference=reference,
-            sender_wallet_number=sender_wallet.wallet_number,
-            recipient_wallet_number=recipient_wallet.wallet_number,
-            description=f"Transfer to {recipient_wallet.wallet_number}"
-        )
-
-        old_sender_balance = sender_wallet.balance
-        sender_wallet.balance -= amount
-        sender_wallet.updated_at = datetime.utcnow()
-
-        old_recipient_balance = recipient_wallet.balance
-        recipient_wallet.balance += amount
-        recipient_wallet.updated_at = datetime.utcnow()
-
-        session.add(transaction)
-        await session.commit()
-        await session.refresh(transaction)
-
-        logger.info(
-            f"Transfer completed: {reference} | "
-            f"Sender: {old_sender_balance} -> {sender_wallet.balance} | "
-            f"Recipient: {old_recipient_balance} -> {recipient_wallet.balance}"
-        )
-
-        return transaction
+            return transaction
 
     @staticmethod
     async def get_transaction_by_reference(
